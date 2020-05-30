@@ -1,19 +1,56 @@
+use async_trait::async_trait;
+use futures::{join, StreamExt};
 use lapin::{
-    message::DeliveryResult, options::*, types::FieldTable, BasicProperties, Connection,
-    ConnectionProperties, Result,
+    options::*, types::FieldTable, BasicProperties, Connection, ConnectionProperties, Error, Result,
 };
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::time::Duration;
 use tokio_amqp::*;
 use warp::{Filter, Rejection, Reply};
 
 type WebResult<T> = std::result::Result<T, Rejection>;
+pub type Pool = deadpool::managed::Pool<lapin::Connection, Error>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rmq_con = get_rmq_con().await?;
-    let shared_rmq_con = Arc::new(rmq_con);
-    let channel = shared_rmq_con.create_channel().await?;
+    let addr = std::env::var("AMQP_ADDR")
+        .unwrap_or_else(|_| "amqp://rmq:rmq@127.0.0.1:5672/%2f?connection_timeout=3000".into());
+    let manager = Manager::new(addr, ConnectionProperties::default().with_tokio());
+    let pool = deadpool::managed::Pool::new(manager, 10);
+
+    let health_route = warp::path!("health").and_then(health_handler);
+    let add_msg_route = warp::path!("msg")
+        .and(warp::post())
+        .and(with_rmq(pool.clone()))
+        .and_then(add_msg_handler);
+    let routes = health_route
+        .or(add_msg_route)
+        .with(warp::cors().allow_any_origin());
+
+    println!("Started server at localhost:8000");
+    let _ = join!(
+        warp::serve(routes).run(([0, 0, 0, 0], 8000)),
+        rmq_listen(pool.clone())
+    );
+    Ok(())
+}
+
+async fn rmq_listen(pool: Pool) -> Result<()> {
+    let mut retry_interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        retry_interval.tick().await;
+        println!("connecting rmq consumer...");
+        match init_rmq_listen(pool.clone()).await {
+            Ok(_) => println!("rmq listen returned"),
+            Err(e) => eprintln!("rmq listen had an error: {}", e),
+        };
+    }
+}
+
+async fn init_rmq_listen(pool: Pool) -> Result<()> {
+    let rmq_con = get_rmq_con(pool).await?;
+    let channel = rmq_con.create_channel().await?;
+
     let queue = channel
         .queue_declare(
             "hello",
@@ -21,10 +58,9 @@ async fn main() -> Result<()> {
             FieldTable::default(),
         )
         .await?;
-
     println!("Declared queue {:?}", queue);
 
-    let consumer = channel
+    let mut consumer = channel
         .basic_consume(
             "hello",
             "my_consumer",
@@ -33,49 +69,37 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    consumer.set_delegate(move |delivery: DeliveryResult| async move {
-        let delivery = delivery.expect("error caught in in consumer");
-        if let Some((channel, delivery)) = delivery {
+    println!("rmq consumer connected, waiting for messages");
+    while let Some(delivery) = consumer.next().await {
+        if let Ok((channel, delivery)) = delivery {
             println!("received msg: {:?}", delivery);
             channel
                 .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                .await
-                .expect("failed to ack");
+                .await?
         }
-    })?;
-
-    println!("set up consumer");
-
-    let health_route = warp::path!("health").and_then(health_handler);
-    let add_msg_route = warp::path!("msg")
-        .and(warp::post())
-        .and(with_rmq(shared_rmq_con.clone()))
-        .and_then(add_msg_handler);
-    let routes = health_route
-        .or(add_msg_route)
-        .with(warp::cors().allow_any_origin());
-
-    println!("Started server at localhost:8000");
-    warp::serve(routes).run(([0, 0, 0, 0], 8000)).await;
+    }
     Ok(())
-}
-
-fn with_rmq(
-    conn: Arc<Connection>,
-) -> impl Filter<Extract = (Arc<Connection>,), Error = Infallible> + Clone {
-    warp::any().map(move || conn.clone())
 }
 
 async fn health_handler() -> WebResult<impl Reply> {
     Ok("OK")
 }
 
-async fn add_msg_handler(conn: Arc<Connection>) -> WebResult<impl Reply> {
+fn with_rmq(pool: Pool) -> impl Filter<Extract = (Pool,), Error = Infallible> + Clone {
+    warp::any().map(move || pool.clone())
+}
+
+async fn add_msg_handler(pool: Pool) -> WebResult<impl Reply> {
+    // TODO: use connection pool
     let payload = b"Hello world!";
-    let channel = conn
-        .create_channel()
-        .await
-        .map_err(|_| warp::reject::reject())?;
+    let rmq_con = get_rmq_con(pool).await.map_err(|e| {
+        eprintln!("can't connect to rmq, {}", e);
+        warp::reject::reject()
+    })?;
+    let channel = rmq_con.create_channel().await.map_err(|e| {
+        eprintln!("can't create channel, {}", e);
+        warp::reject::reject()
+    })?;
 
     channel
         .basic_publish(
@@ -86,14 +110,55 @@ async fn add_msg_handler(conn: Arc<Connection>) -> WebResult<impl Reply> {
             BasicProperties::default(),
         )
         .await
-        .map_err(|_| warp::reject::reject())?
+        .map_err(|e| {
+            eprintln!("can't publish: {}", e);
+            warp::reject::reject()
+        })?
         .await
-        .map_err(|_| warp::reject::reject())?;
+        .map_err(|e| {
+            eprintln!("can't publish: {}", e);
+            warp::reject::reject()
+        })?;
     Ok("OK")
 }
 
-async fn get_rmq_con() -> Result<Connection> {
-    let addr = std::env::var("AMQP_ADDR")
-        .unwrap_or_else(|_| "amqp://rmq:rmq@127.0.0.1:5672/%2f?connection_timeout=5000".into());
-    Connection::connect(&addr, ConnectionProperties::default().with_tokio()).await
+async fn get_rmq_con(pool: Pool) -> Result<deadpool::managed::Object<Connection, Error>> {
+    let connection = pool.get().await.map_err(|_| Error::InvalidChannel(1))?; // TODO: handle error properly, custom error type
+    Ok(connection)
+}
+
+pub struct Manager {
+    addr: String,
+    connection_properties: ConnectionProperties,
+}
+
+impl Manager {
+    pub fn new(addr: String, connection_properties: ConnectionProperties) -> Self {
+        Self {
+            addr: addr,
+            connection_properties: connection_properties,
+        }
+    }
+}
+type RecycleResult = deadpool::managed::RecycleResult<Error>;
+type RecycleError = deadpool::managed::RecycleError<Error>;
+
+#[async_trait]
+impl deadpool::managed::Manager<lapin::Connection, Error> for Manager {
+    async fn create(&self) -> Result<lapin::Connection> {
+        let connection =
+            lapin::Connection::connect(self.addr.as_str(), self.connection_properties.clone())
+                .await?;
+        Ok(connection)
+    }
+
+    async fn recycle(&self, connection: &mut lapin::Connection) -> RecycleResult {
+        match connection.status().state() {
+            lapin::ConnectionState::Connected => Ok(()),
+            other_state => Err(RecycleError::Message(format!(
+                "lapin connection is in state: {:?}",
+                other_state
+            ))),
+        }
+    }
 }
