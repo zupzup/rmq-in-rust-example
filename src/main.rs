@@ -1,15 +1,29 @@
 use async_trait::async_trait;
 use futures::{join, StreamExt};
-use lapin::{
-    options::*, types::FieldTable, BasicProperties, Connection, ConnectionProperties, Error, Result,
-};
+use lapin::{options::*, types::FieldTable, BasicProperties, ConnectionProperties};
 use std::convert::Infallible;
+use std::result::Result as StdResult;
 use std::time::Duration;
+use thiserror::Error as ThisError;
 use tokio_amqp::*;
 use warp::{Filter, Rejection, Reply};
 
-type WebResult<T> = std::result::Result<T, Rejection>;
-pub type Pool = deadpool::managed::Pool<lapin::Connection, Error>;
+type WebResult<T> = StdResult<T, Rejection>;
+type RMQResult<T> = StdResult<T, PoolError>;
+type Result<T> = StdResult<T, Error>;
+
+type Pool = deadpool::managed::Pool<lapin::Connection, lapin::Error>;
+type Connection = deadpool::managed::Object<lapin::Connection, lapin::Error>;
+
+#[derive(ThisError, Debug)]
+enum Error {
+    #[error("rmq error: {0}")]
+    RMQError(#[from] lapin::Error),
+    #[error("rmq pool error: {0}")]
+    RMQPoolError(#[from] PoolError),
+}
+
+impl warp::reject::Reject for Error {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,6 +49,53 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn with_rmq(pool: Pool) -> impl Filter<Extract = (Pool,), Error = Infallible> + Clone {
+    warp::any().map(move || pool.clone())
+}
+
+async fn add_msg_handler(pool: Pool) -> WebResult<impl Reply> {
+    let payload = b"Hello world!";
+
+    let rmq_con = get_rmq_con(pool).await.map_err(|e| {
+        eprintln!("can't connect to rmq, {}", e);
+        warp::reject::custom(Error::RMQPoolError(e))
+    })?;
+
+    let channel = rmq_con.create_channel().await.map_err(|e| {
+        eprintln!("can't create channel, {}", e);
+        warp::reject::custom(Error::RMQError(e))
+    })?;
+
+    channel
+        .basic_publish(
+            "",
+            "hello",
+            BasicPublishOptions::default(),
+            payload.to_vec(),
+            BasicProperties::default(),
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("can't publish: {}", e);
+            warp::reject::custom(Error::RMQError(e))
+        })?
+        .await
+        .map_err(|e| {
+            eprintln!("can't publish: {}", e);
+            warp::reject::custom(Error::RMQError(e))
+        })?;
+    Ok("OK")
+}
+
+async fn health_handler() -> WebResult<impl Reply> {
+    Ok("OK")
+}
+
+async fn get_rmq_con(pool: Pool) -> RMQResult<Connection> {
+    let connection = pool.get().await?;
+    Ok(connection)
+}
+
 async fn rmq_listen(pool: Pool) -> Result<()> {
     let mut retry_interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -48,7 +109,10 @@ async fn rmq_listen(pool: Pool) -> Result<()> {
 }
 
 async fn init_rmq_listen(pool: Pool) -> Result<()> {
-    let rmq_con = get_rmq_con(pool).await?;
+    let rmq_con = get_rmq_con(pool).await.map_err(|e| {
+        eprintln!("could not get rmq con: {}", e);
+        e
+    })?;
     let channel = rmq_con.create_channel().await?;
 
     let queue = channel
@@ -81,52 +145,7 @@ async fn init_rmq_listen(pool: Pool) -> Result<()> {
     Ok(())
 }
 
-async fn health_handler() -> WebResult<impl Reply> {
-    Ok("OK")
-}
-
-fn with_rmq(pool: Pool) -> impl Filter<Extract = (Pool,), Error = Infallible> + Clone {
-    warp::any().map(move || pool.clone())
-}
-
-async fn add_msg_handler(pool: Pool) -> WebResult<impl Reply> {
-    // TODO: use connection pool
-    let payload = b"Hello world!";
-    let rmq_con = get_rmq_con(pool).await.map_err(|e| {
-        eprintln!("can't connect to rmq, {}", e);
-        warp::reject::reject()
-    })?;
-    let channel = rmq_con.create_channel().await.map_err(|e| {
-        eprintln!("can't create channel, {}", e);
-        warp::reject::reject()
-    })?;
-
-    channel
-        .basic_publish(
-            "",
-            "hello",
-            BasicPublishOptions::default(),
-            payload.to_vec(),
-            BasicProperties::default(),
-        )
-        .await
-        .map_err(|e| {
-            eprintln!("can't publish: {}", e);
-            warp::reject::reject()
-        })?
-        .await
-        .map_err(|e| {
-            eprintln!("can't publish: {}", e);
-            warp::reject::reject()
-        })?;
-    Ok("OK")
-}
-
-async fn get_rmq_con(pool: Pool) -> Result<deadpool::managed::Object<Connection, Error>> {
-    let connection = pool.get().await.map_err(|_| Error::InvalidChannel(1))?; // TODO: handle error properly, custom error type
-    Ok(connection)
-}
-
+// TODO: remove once 1.0.0 deadpool-lapin is merged
 pub struct Manager {
     addr: String,
     connection_properties: ConnectionProperties,
@@ -140,12 +159,14 @@ impl Manager {
         }
     }
 }
-type RecycleResult = deadpool::managed::RecycleResult<Error>;
-type RecycleError = deadpool::managed::RecycleError<Error>;
+
+type PoolError = deadpool::managed::PoolError<lapin::Error>;
+type RecycleResult = deadpool::managed::RecycleResult<lapin::Error>;
+type RecycleError = deadpool::managed::RecycleError<lapin::Error>;
 
 #[async_trait]
-impl deadpool::managed::Manager<lapin::Connection, Error> for Manager {
-    async fn create(&self) -> Result<lapin::Connection> {
+impl deadpool::managed::Manager<lapin::Connection, lapin::Error> for Manager {
+    async fn create(&self) -> StdResult<lapin::Connection, lapin::Error> {
         let connection =
             lapin::Connection::connect(self.addr.as_str(), self.connection_properties.clone())
                 .await?;

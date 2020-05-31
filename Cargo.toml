@@ -16,4 +16,5 @@ uuid = { version = "0.4", features = ["serde", "v4"] }
 tokio-amqp = "0.1.0"
 lapin = "1.0.0"
 deadpool = "0.5.1"
+thiserror = "1.0.15"
 async-trait = "0.1.17"
