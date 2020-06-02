@@ -1,4 +1,4 @@
-use async_trait::async_trait;
+use deadpool_lapin::{Manager, PoolError};
 use futures::{join, StreamExt};
 use lapin::{options::*, types::FieldTable, BasicProperties, ConnectionProperties};
 use std::convert::Infallible;
@@ -24,6 +24,7 @@ enum Error {
 }
 
 impl warp::reject::Reject for Error {}
+// TODO: use latest master in deadpool-lapin
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -143,43 +144,4 @@ async fn init_rmq_listen(pool: Pool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-// TODO: remove once 1.0.0 deadpool-lapin is merged
-pub struct Manager {
-    addr: String,
-    connection_properties: ConnectionProperties,
-}
-
-impl Manager {
-    pub fn new(addr: String, connection_properties: ConnectionProperties) -> Self {
-        Self {
-            addr: addr,
-            connection_properties: connection_properties,
-        }
-    }
-}
-
-type PoolError = deadpool::managed::PoolError<lapin::Error>;
-type RecycleResult = deadpool::managed::RecycleResult<lapin::Error>;
-type RecycleError = deadpool::managed::RecycleError<lapin::Error>;
-
-#[async_trait]
-impl deadpool::managed::Manager<lapin::Connection, lapin::Error> for Manager {
-    async fn create(&self) -> StdResult<lapin::Connection, lapin::Error> {
-        let connection =
-            lapin::Connection::connect(self.addr.as_str(), self.connection_properties.clone())
-                .await?;
-        Ok(connection)
-    }
-
-    async fn recycle(&self, connection: &mut lapin::Connection) -> RecycleResult {
-        match connection.status().state() {
-            lapin::ConnectionState::Connected => Ok(()),
-            other_state => Err(RecycleError::Message(format!(
-                "lapin connection is in state: {:?}",
-                other_state
-            ))),
-        }
-    }
 }
