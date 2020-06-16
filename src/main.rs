@@ -28,8 +28,8 @@ impl warp::reject::Reject for Error {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr = std::env::var("AMQP_ADDR")
-        .unwrap_or_else(|_| "amqp://rmq:rmq@127.0.0.1:5672/%2f?connection_timeout=3000".into());
+    let addr =
+        std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rmq:rmq@127.0.0.1:5672/%2f".into());
     let manager = Manager::new(addr, ConnectionProperties::default().with_tokio());
     let pool = deadpool::managed::Pool::new(manager, 10);
 
@@ -38,9 +38,7 @@ async fn main() -> Result<()> {
         .and(warp::post())
         .and(with_rmq(pool.clone()))
         .and_then(add_msg_handler);
-    let routes = health_route
-        .or(add_msg_route)
-        .with(warp::cors().allow_any_origin());
+    let routes = health_route.or(add_msg_route);
 
     println!("Started server at localhost:8000");
     let _ = join!(
