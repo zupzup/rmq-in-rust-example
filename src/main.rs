@@ -24,7 +24,6 @@ enum Error {
 }
 
 impl warp::reject::Reject for Error {}
-// TODO: use latest master in deadpool-lapin
 
 #[tokio::main]
 async fn main() -> Result<()> {
