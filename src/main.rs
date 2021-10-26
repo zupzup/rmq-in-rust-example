@@ -1,4 +1,4 @@
-use deadpool_lapin::{Manager, PoolError};
+use deadpool_lapin::{Manager, Pool, PoolError};
 use futures::{join, StreamExt};
 use lapin::{options::*, types::FieldTable, BasicProperties, ConnectionProperties};
 use std::convert::Infallible;
@@ -11,9 +11,7 @@ use warp::{Filter, Rejection, Reply};
 type WebResult<T> = StdResult<T, Rejection>;
 type RMQResult<T> = StdResult<T, PoolError>;
 type Result<T> = StdResult<T, Error>;
-
-type Pool = deadpool::managed::Pool<lapin::Connection, lapin::Error>;
-type Connection = deadpool::managed::Object<lapin::Connection, lapin::Error>;
+type Connection = deadpool::managed::Object<deadpool_lapin::Manager>;
 
 #[derive(ThisError, Debug)]
 enum Error {
@@ -30,7 +28,10 @@ async fn main() -> Result<()> {
     let addr =
         std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rmq:rmq@127.0.0.1:5672/%2f".into());
     let manager = Manager::new(addr, ConnectionProperties::default().with_tokio());
-    let pool = deadpool::managed::Pool::new(manager, 10);
+    let pool: Pool = deadpool::managed::Pool::builder(manager)
+        .max_size(10)
+        .build()
+        .expect("can create pool");
 
     let health_route = warp::path!("health").and_then(health_handler);
     let add_msg_route = warp::path!("msg")
